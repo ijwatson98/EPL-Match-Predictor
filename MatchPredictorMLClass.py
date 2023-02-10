@@ -18,12 +18,12 @@ from plotly import graph_objects as go
 class MatchPredictorML():
     
     
-    def __init__(self):
+    def __init__(self, data):
         
-        self.data = pd.read_csv("matches.csv", index_col=0)
-        self.trials = Trials()
+        self.data = pd.read_csv(data, index_col=0)
         self._predictions = {}
         self._performance = {}
+        self.model = None
         
         pass
     
@@ -47,40 +47,12 @@ class MatchPredictorML():
         
         self.X_val = val.drop(target, axis=1)
         self.y_val = val[target]
-          
         
-    def objective(self, space):
-    
-        model = xgb.XGBClassifier(objective="multi:softmax", 
-                                  num_class=3,
-                                  max_depth=space['max_depth'],
-                                  min_child_weight=space['min_child_weight'],
-                                  n_estimators=space['n_estimators'],
-                                  gamma=space['gamma'],
-                                  learning_rate=space['learning_rate'],
-                                  reg_lambda=space['reg_lambda'],
-                                  eval_metric="mlogloss",
-                                  early_stopping_rounds=space['early_stopping_rounds'],
-                                  subsample=space['subsample']
-                                 )
-        
-        evaluation=[(self.X_test, self.y_test)]
-        
-        model.fit(self.X_train, self.y_train, eval_set=evaluation, verbose=False)
-        
-        y_pred_probs = model.predict_proba(self.X_test)
-        y_pred = model.predict(self.X_test)
-        
-        score1 = cohen_kappa_score(self.y_test, y_pred)
-        score2 = roc_auc_score(self.y_test, y_pred_probs, multi_class='ovo')
-        
-        loss = 1-(0.7*score1+0.3*score2)/2
-        
-        return {'loss': loss, 'status': STATUS_OK, 'model': model}
-    
+                  
     
     def optimise(self, objective, space, max_evals=1000):
         
+        self.trials = Trials()
         self.best_params = fmin(fn=objective,
                                 space=space,
                                 algo=tpe.suggest,
@@ -96,12 +68,10 @@ class MatchPredictorML():
         index_having_minumum_loss = np.argmin(losses)
         best_trial_obj = valid_trial_list[index_having_minumum_loss]
         
-        return best_trial_obj['result']['model']
+        self.model = best_trial_obj['result']['model']
     
     
     def fit(self):
-        
-        self.model = self.getBestModelfromTrials()
         
         evaluation=[(self.X_train, self.y_train), (self.X_test, self.y_test)]
         self.model.fit(self.X_train, self.y_train, eval_set=evaluation, verbose=False)
@@ -115,7 +85,8 @@ class MatchPredictorML():
         
     def validate(self, model_name):
         
-        self._performance[model_name] = accuracy_score(self._predictions[model_name], self.y_test)
+        self._performance["Accuracy - "+model_name] = accuracy_score(self.y_test, self._predictions[model_name])
+        self._performance["F1 - "+model_name] = self.macro_f1(self.y_test, self._predictions[model_name])
         
 
     def confusionMatrix(self):
@@ -138,10 +109,10 @@ class MatchPredictorML():
         self.trials_df["loss"] = [t["result"]["loss"] for t in self.trials]
         self.trials_df["trial_number"] = self.trials_df.index
         
-        filter = (self.trials_df[constant] == constant_val)
+        filter = (self.trials_df[constant]==constant_val)
 
         fig = go.Figure(
-            data=[go.Contour(
+            data=go.Contour(
                 z=self.trials_df[filter]["loss"],
                 x=self.trials_df[filter][parameter1],
                 y=self.trials_df[filter][parameter2],
@@ -151,7 +122,7 @@ class MatchPredictorML():
                 ),
                 colorbar=dict(title="loss", titleside="right",),
                 hovertemplate="loss: %{z}<br>"+parameter1+": %{x}<br>"+parameter2+": %{y}<extra></extra>",
-            )]
+            )
         )
     
         fig.update_layout(
@@ -166,6 +137,7 @@ class MatchPredictorML():
         )
         
         return fig
+
         
     
     def featureImportance(self):
@@ -181,9 +153,91 @@ class MatchPredictorML():
         self.results = self.model.evals_result()
 
         plt.figure(figsize=(10,7))
-        plt.plot(self.results["validation_0"]["mlogloss"], label="Training loss")
-        plt.plot(self.results["validation_1"]["mlogloss"], label="Validation loss")
-        plt.axvline(self.model.best_ntree_limit, color="gray", label="Optimal tree number")
+        plt.plot(self.results["validation_0"]["merror"], label="Training loss", c="darkturquoise")
+        plt.plot(self.results["validation_1"]["merror"], label="Validation loss", c="darkblue")
         plt.xlabel("Number of trees")
         plt.ylabel("Loss")
         plt.legend()
+        
+
+    @staticmethod
+    def true_positive(y_true, y_pred):
+        
+        tp = 0
+        for yt, yp in zip(y_true, y_pred):
+            if yt == 1 and yp == 1:
+                tp += 1
+                
+        return tp
+    
+    @staticmethod
+    def true_negative(y_true, y_pred):
+        
+        tn = 0
+        for yt, yp in zip(y_true, y_pred):
+            if yt == 0 and yp == 0:
+                tn += 1
+                
+        return tn
+    @staticmethod
+    def false_positive(y_true, y_pred):
+        
+        fp = 0
+        for yt, yp in zip(y_true, y_pred):
+            if yt == 0 and yp == 1:
+                fp += 1
+                
+        return fp
+    @staticmethod
+    def false_negative(y_true, y_pred):
+        
+        fn = 0
+        for yt, yp in zip(y_true, y_pred):
+            if yt == 1 and yp == 0:
+                fn += 1
+                
+        return fn 
+    
+
+    def macro_f1(self, y_true, y_pred):
+    
+        # find the number of classes
+        num_classes = len(np.unique(y_true))
+    
+        # initialize f1 to 0
+        f1 = 0
+        
+        # loop over all classes
+        for class_ in list(np.unique(y_true)):
+            
+            # all classes except current are considered negative
+            temp_true = [1 if p == class_ else 0 for p in y_true]
+            temp_pred = [1 if p == class_ else 0 for p in y_pred]
+            
+            
+            # compute true positive for current class
+            tp = MatchPredictorML.true_positive(temp_true, temp_pred)
+            
+            # compute false negative for current class
+            fn = MatchPredictorML.false_negative(temp_true, temp_pred)
+            
+            # compute false positive for current class
+            fp = MatchPredictorML.false_positive(temp_true, temp_pred)
+            
+            # compute recall for current class
+            temp_recall = tp / (tp + fn + 1e-6)
+            
+            # compute precision for current class
+            temp_precision = tp / (tp + fp + 1e-6)
+            
+            
+            temp_f1 = 2 * temp_precision * temp_recall / (temp_precision + temp_recall + 1e-6)
+            
+            # keep adding f1 score for all classes
+            f1 += temp_f1
+            
+        # calculate and return average f1 score over all classes
+        f1 /= num_classes
+        
+        return f1
+        
